@@ -40,12 +40,21 @@ def start_mqtt_listener(app, db, Device, Reading):
 
     def on_connect(client, userdata, flags, rc, properties=None):
         if rc == 0:
-            print(f"[MQTT] Connected, subscribing to {MQTT_TOPIC}")
-            client.subscribe(MQTT_TOPIC)
+            print(f"[MQTT] Connected. Requesting subscription to '{MQTT_TOPIC}'...")
+            result, mid = client.subscribe(MQTT_TOPIC)
+            print(f"[MQTT] subscribe() call returned result={result}, mid={mid}")
         else:
             print(f"[MQTT] Connection failed, rc={rc}")
 
+    def on_subscribe(client, userdata, mid, reason_codes, properties=None):
+        # This is the ACTUAL confirmation from the broker that the
+        # subscription was granted - previously we only logged our own
+        # request, never whether HiveMQ accepted it. reason_codes of 128+
+        # indicate the broker rejected the subscription (e.g. ACL denial).
+        print(f"[MQTT] Broker acknowledged subscription (mid={mid}): reason_codes={reason_codes}")
+
     def on_message(client, userdata, msg):
+        print(f"[MQTT] Message received on topic '{msg.topic}' ({len(msg.payload)} bytes)")
         with app.app_context():
             try:
                 handle_message(msg.payload, db, Device, Reading)
@@ -53,11 +62,18 @@ def start_mqtt_listener(app, db, Device, Reading):
                 # Never let a bad/malformed message kill the listener thread
                 print(f"[MQTT] Error handling message: {e}")
 
+    def on_log(client, userdata, level, buf):
+        # Low-level client library log - catches things like malformed
+        # packets or TLS issues that wouldn't otherwise surface anywhere.
+        print(f"[MQTT LOG] {buf}")
+
     client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
     client.username_pw_set(MQTT_USER, MQTT_PASS)
     client.tls_set()
     client.on_connect = on_connect
+    client.on_subscribe = on_subscribe
     client.on_message = on_message
+    client.on_log = on_log
 
     def run():
         while True:
