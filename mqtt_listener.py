@@ -1,5 +1,6 @@
 import struct
 import threading
+import time
 from datetime import datetime
 
 import numpy as np
@@ -17,15 +18,24 @@ DEVICE_ID = "sensor1"  # TODO: derive from topic once you have multiple devices/
 
 # Rolling-baseline anomaly detection: flag a reading if it deviates more
 # than ANOMALY_K standard deviations from the device's own recent history.
-# This is the mean/stddev approach discussed earlier - self-scales to each
-# device's normal noise level instead of using one fixed threshold for
-# every installation. Needs a minimum amount of history before it
-# activates, same reasoning as the "run 4-5 baseline captures at install"
-# plan - here it just accumulates that history automatically over the
-# device's first several readings instead of a separate manual step.
 ANOMALY_K = 3.0
 MIN_HISTORY_FOR_BASELINE = 5
 BASELINE_WINDOW = 50
+
+# --- Chunk reassembly ---
+# CHANGED: the ESP32 now splits each capture into several smaller MQTT
+# messages (a single large streamed publish kept dying mid-transfer at a
+# consistent ~5KB point, root-caused to a hard ceiling in the ESP32's
+# network stack, not something fixable by retry-tuning alone - see
+# firmware comments). Each message header is 16 bytes: capture_id(4),
+# chunk_index(2), total_chunks(2), num_samples(4), sample_rate(4),
+# followed by that chunk's raw float32 sample data.
+#
+# pending_captures holds partial captures in memory until all their
+# chunks arrive: { capture_id: {"chunks": {index: bytes}, "total": N,
+# "num_samples": X, "sample_rate": Y, "first_seen": timestamp} }
+pending_captures = {}
+CAPTURE_TIMEOUT_SECONDS = 120  # drop incomplete captures older than this
 
 
 def start_mqtt_listener(app, db, Device, Reading):
@@ -47,24 +57,17 @@ def start_mqtt_listener(app, db, Device, Reading):
             print(f"[MQTT] Connection failed, rc={rc}")
 
     def on_subscribe(client, userdata, mid, reason_codes, properties=None):
-        # This is the ACTUAL confirmation from the broker that the
-        # subscription was granted - previously we only logged our own
-        # request, never whether HiveMQ accepted it. reason_codes of 128+
-        # indicate the broker rejected the subscription (e.g. ACL denial).
         print(f"[MQTT] Broker acknowledged subscription (mid={mid}): reason_codes={reason_codes}")
 
     def on_message(client, userdata, msg):
-        print(f"[MQTT] Message received on topic '{msg.topic}' ({len(msg.payload)} bytes)")
         with app.app_context():
             try:
-                handle_message(msg.payload, db, Device, Reading)
+                handle_chunk(msg.payload, db, Device, Reading)
             except Exception as e:
                 # Never let a bad/malformed message kill the listener thread
                 print(f"[MQTT] Error handling message: {e}")
 
     def on_log(client, userdata, level, buf):
-        # Low-level client library log - catches things like malformed
-        # packets or TLS issues that wouldn't otherwise surface anywhere.
         print(f"[MQTT LOG] {buf}")
 
     client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
@@ -82,7 +85,6 @@ def start_mqtt_listener(app, db, Device, Reading):
                 client.loop_forever()
             except Exception as e:
                 print(f"[MQTT] Connection error: {e}. Retrying in 10s...")
-                import time
                 time.sleep(10)
 
     thread = threading.Thread(target=run, daemon=True)
@@ -90,18 +92,59 @@ def start_mqtt_listener(app, db, Device, Reading):
     print("[MQTT] Listener thread started.")
 
 
-def handle_message(payload: bytes, db, Device, Reading):
-    if len(payload) < 8:
-        print("[MQTT] Payload too short, ignoring.")
+def cleanup_stale_captures():
+    now = time.time()
+    stale = [cid for cid, c in pending_captures.items()
+             if now - c["first_seen"] > CAPTURE_TIMEOUT_SECONDS]
+    for cid in stale:
+        c = pending_captures.pop(cid)
+        print(f"[MQTT] Dropping incomplete capture {cid}: "
+              f"only got {len(c['chunks'])}/{c['total']} chunks before timeout.")
+
+
+def handle_chunk(payload: bytes, db, Device, Reading):
+    if len(payload) < 16:
+        print(f"[MQTT] Chunk too short ({len(payload)} bytes), ignoring.")
         return
 
-    sample_count, sample_rate = struct.unpack('<II', payload[:8])
-    expected_bytes = 8 + (sample_count * 4)
-    if len(payload) != expected_bytes:
-        print(f"[MQTT] Payload size mismatch: expected {expected_bytes}, got {len(payload)}. Discarding.")
-        return
+    capture_id, chunk_index, total_chunks, num_samples, sample_rate = struct.unpack('<IHHII', payload[:16])
+    chunk_data = payload[16:]
 
-    samples = np.frombuffer(payload[8:], dtype='<f4')
+    if capture_id not in pending_captures:
+        pending_captures[capture_id] = {
+            "chunks": {},
+            "total": total_chunks,
+            "num_samples": num_samples,
+            "sample_rate": sample_rate,
+            "first_seen": time.time(),
+        }
+
+    capture = pending_captures[capture_id]
+    capture["chunks"][chunk_index] = chunk_data
+
+    print(f"[MQTT] Capture {capture_id}: chunk {chunk_index + 1}/{total_chunks} received "
+          f"({len(capture['chunks'])}/{total_chunks} total so far)")
+
+    if len(capture["chunks"]) == capture["total"]:
+        # All chunks in - reassemble in correct order and process.
+        ordered = [capture["chunks"][i] for i in range(capture["total"])]
+        full_payload = b"".join(ordered)
+
+        expected_bytes = capture["num_samples"] * 4
+        if len(full_payload) != expected_bytes:
+            print(f"[MQTT] Capture {capture_id} reassembled size mismatch: "
+                  f"expected {expected_bytes}, got {len(full_payload)}. Discarding.")
+            del pending_captures[capture_id]
+            return
+
+        samples = np.frombuffer(full_payload, dtype='<f4')
+        process_and_store(samples, capture["sample_rate"], full_payload, db, Device, Reading)
+        del pending_captures[capture_id]
+
+    cleanup_stale_captures()
+
+
+def process_and_store(samples: np.ndarray, sample_rate: int, raw_payload: bytes, db, Device, Reading):
     features = process_waveform(samples, sample_rate)
 
     if Device.query.get(DEVICE_ID) is None:
@@ -131,7 +174,7 @@ def handle_message(payload: bytes, db, Device, Reading):
         device_id=DEVICE_ID,
         timestamp=datetime.utcnow(),
         sample_rate=sample_rate,
-        num_samples=sample_count,
+        num_samples=len(samples),
         rms_velocity_mms=features["rms_velocity_mms"],
         peak_to_peak_velocity_mms=features["peak_to_peak_velocity_mms"],
         absolute_peak_velocity_mms=features["absolute_peak_velocity_mms"],
@@ -139,7 +182,7 @@ def handle_message(payload: bytes, db, Device, Reading):
         dominant_freq_hz=features["dominant_freq_hz"],
         dominant_freq_mag=features["dominant_freq_mag"],
         is_anomaly=is_anomaly,
-        raw_waveform=payload[8:] if is_anomaly else None,
+        raw_waveform=raw_payload if is_anomaly else None,
     )
     db.session.add(reading)
     db.session.commit()
