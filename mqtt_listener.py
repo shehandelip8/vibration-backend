@@ -182,7 +182,15 @@ def process_and_store(samples: np.ndarray, sample_rate: int, raw_payload: bytes,
         dominant_freq_hz=features["dominant_freq_hz"],
         dominant_freq_mag=features["dominant_freq_mag"],
         is_anomaly=is_anomaly,
-        raw_waveform=raw_payload if is_anomaly else None,
+        # CHANGED (temporary, for validation phase): was `raw_payload if
+        # is_anomaly else None` - only kept raw data for flagged anomalies,
+        # to avoid unbounded DB growth in production. Right now every
+        # reading needs its raw waveform available for inspection/FFT
+        # work, so this saves it unconditionally. Revert to the
+        # is_anomaly-gated version before real deployment - a live fleet
+        # of devices uploading every 15 minutes would otherwise grow the
+        # database indefinitely.
+        raw_waveform=raw_payload,
     )
     db.session.add(reading)
     db.session.commit()
