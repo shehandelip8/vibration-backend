@@ -3,6 +3,44 @@ import numpy as np
 G_TO_MMS2 = 9806.65  # 1g = 9806.65 mm/s^2 - same constant used in the ESP32 firmware
 
 
+def compute_spectrum(samples: np.ndarray, sample_rate: float):
+    """
+    Windowed FFT magnitude spectrum - shared by process_waveform's dominant-
+    peak search and the new harmonic-lookup feature, so both use the exact
+    same underlying math rather than two separate FFT implementations.
+    """
+    n = len(samples)
+    windowed = samples * np.hanning(n)
+    fft_result = np.fft.rfft(windowed)
+    magnitude = np.abs(fft_result)
+    freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
+    return freqs, magnitude
+
+
+def get_harmonic_magnitudes(freqs: np.ndarray, magnitude: np.ndarray, base_freq: float, num_harmonics: int = 4):
+    """
+    Looks up the magnitude at 1x, 2x, 3x, 4x (etc) of a given base frequency
+    (e.g. a tachometer-measured running speed converted to Hz). Since the
+    true harmonic frequency won't usually land exactly on a bin center,
+    this reports the actual bin frequency used alongside the target, so you
+    can see how close it landed - same "close is the win, not exact"
+    reasoning as the synthetic FFT validation test.
+    """
+    bin_resolution = freqs[1] - freqs[0]
+    results = []
+    for h in range(1, num_harmonics + 1):
+        target_freq = base_freq * h
+        idx = int(round(target_freq / bin_resolution))
+        idx = min(idx, len(magnitude) - 1)
+        results.append({
+            "harmonic": h,
+            "target_freq_hz": target_freq,
+            "bin_freq_hz": float(freqs[idx]),
+            "magnitude": float(magnitude[idx]),
+        })
+    return results
+
+
 def process_waveform(samples: np.ndarray, sample_rate: float):
     """
     Takes raw acceleration samples (in g) and returns time-domain and
@@ -34,10 +72,7 @@ def process_waveform(samples: np.ndarray, sample_rate: float):
     crest_factor = absolute_peak / rms_velocity if rms_velocity > 0.001 else 0.0
 
     # --- Frequency-domain: windowed FFT on raw acceleration ---
-    windowed = samples * np.hanning(n)
-    fft_result = np.fft.rfft(windowed)
-    magnitude = np.abs(fft_result)
-    freqs = np.fft.rfftfreq(n, d=dt)
+    freqs, magnitude = compute_spectrum(samples, sample_rate)
 
     # Skip the first couple of bins (DC/near-DC) before finding the peak -
     # same reasoning as the firmware's peak search.
