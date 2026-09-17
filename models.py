@@ -28,6 +28,16 @@ class Reading(db.Model):
 
     is_anomaly = db.Column(db.Boolean, default=False)
 
+    # Spectral fingerprint for machine-specific anomaly detection: energy
+    # in each frequency band (20 bands, 100Hz wide, 0-2000Hz), stored as a
+    # JSON array. Compared against this device's own historical per-band
+    # mean/stddev - see mqtt_listener.py - rather than fixed thresholds,
+    # since which frequencies matter varies by mounting/resonance per
+    # installation (confirmed directly: this project's own test motor
+    # showed its dominant energy at the 4th harmonic of running speed,
+    # not the 1st, which a fixed-frequency rule would have missed).
+    band_energies = db.Column(db.JSON, nullable=True)
+
     # Only populated when is_anomaly=True - storing the full ~64KB raw
     # waveform for EVERY reading (every 15 min) would grow the database
     # unboundedly for no real benefit. This is the server-side equivalent

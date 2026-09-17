@@ -166,7 +166,31 @@ def process_and_store(samples: np.ndarray, sample_rate: int, raw_payload: bytes,
 
         rms_dev = abs(features["rms_velocity_mms"] - rms_mean) > ANOMALY_K * max(rms_std, 1e-6)
         crest_dev = abs(features["crest_factor"] - crest_mean) > ANOMALY_K * max(crest_std, 1e-6)
-        is_anomaly = bool(rms_dev or crest_dev)
+
+        # Per-band spectral fingerprint check: compares each frequency
+        # band's energy against THIS device's own historical mean/stddev
+        # for that band - not a fixed threshold. This is what makes
+        # detection work regardless of which harmonic happens to dominate
+        # a given machine/mounting (confirmed directly on this project's
+        # own test motor: dominant energy sits at the 4th harmonic of
+        # running speed, not the 1st - a fixed-frequency rule would miss
+        # this entirely, but a per-band baseline doesn't care which band
+        # is naturally loud, only whether THIS machine's own bands change).
+        band_dev = False
+        history_with_bands = [r for r in history if r.band_energies is not None]
+        if len(history_with_bands) >= MIN_HISTORY_FOR_BASELINE and features.get("band_energies"):
+            hist_bands = np.array([r.band_energies for r in history_with_bands])
+            band_mean = hist_bands.mean(axis=0)
+            band_std = hist_bands.std(axis=0)
+            current_bands = np.array(features["band_energies"])
+            deviations = np.abs(current_bands - band_mean) > ANOMALY_K * np.maximum(band_std, 1e-6)
+            band_dev = bool(np.any(deviations))
+            if band_dev:
+                flagged = np.where(deviations)[0]
+                band_ranges = [f"{i*100}-{(i+1)*100}Hz" for i in flagged]
+                print(f"[ANOMALY] Band-energy deviation in: {', '.join(band_ranges)}")
+
+        is_anomaly = bool(rms_dev or crest_dev or band_dev)
     else:
         print(f"[ANOMALY] Only {len(history)}/{MIN_HISTORY_FOR_BASELINE} readings so far - still baselining.")
 
@@ -181,6 +205,7 @@ def process_and_store(samples: np.ndarray, sample_rate: int, raw_payload: bytes,
         crest_factor=features["crest_factor"],
         dominant_freq_hz=features["dominant_freq_hz"],
         dominant_freq_mag=features["dominant_freq_mag"],
+        band_energies=features.get("band_energies"),
         is_anomaly=is_anomaly,
         # CHANGED (temporary, for validation phase): was `raw_payload if
         # is_anomaly else None` - only kept raw data for flagged anomalies,
