@@ -56,6 +56,80 @@ def get_waveform(device_id, reading_id):
     return jsonify({"sample_rate": reading.sample_rate, "samples": samples.tolist()})
 
 
+@app.route("/devices/<device_id>/readings/<int:reading_id>/chart")
+def get_waveform_chart(device_id, reading_id):
+    """
+    A full webpage showing the raw waveform as a chart, all 16384 samples.
+    No new Render service, no background worker, no separate hosting -
+    this route lives in the same Flask app as everything else, and the
+    page's JavaScript fetches /waveform (above) from the SAME origin, so
+    no CORS setup is needed either. This is a quick way to see the chart
+    yourself; your frontend developer's real dashboard will eventually
+    replace this with a nicer version, but this is fully functional now.
+    """
+    return f"""
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Waveform - Reading {reading_id}</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body {{ font-family: sans-serif; margin: 24px; }}
+    #status {{ color: #666; }}
+  </style>
+</head>
+<body>
+  <h2>Reading {reading_id} - Raw Waveform</h2>
+  <p id="status">Loading...</p>
+  <canvas id="waveformChart" width="1200" height="400"></canvas>
+
+  <script>
+    fetch('/devices/{device_id}/readings/{reading_id}/waveform')
+      .then(res => res.json())
+      .then(data => {{
+        if (data.error) {{
+          document.getElementById('status').innerText = 'Error: ' + data.error;
+          return;
+        }}
+        const samples = data.samples;
+        const sampleRate = data.sample_rate;
+        document.getElementById('status').innerText =
+          samples.length + ' samples @ ' + sampleRate + ' Hz (' +
+          (samples.length / sampleRate * 1000).toFixed(1) + ' ms window)';
+
+        // Time axis in milliseconds, one label per sample
+        const timeLabels = samples.map((_, i) => (i / sampleRate * 1000).toFixed(2));
+
+        new Chart(document.getElementById('waveformChart'), {{
+          type: 'line',
+          data: {{
+            labels: timeLabels,
+            datasets: [{{
+              label: 'Acceleration (g)',
+              data: samples,
+              borderColor: 'rgb(59, 130, 246)',
+              borderWidth: 1,
+              pointRadius: 0,
+            }}]
+          }},
+          options: {{
+            animation: false,
+            scales: {{
+              x: {{ title: {{ display: true, text: 'Time (ms)' }}, ticks: {{ maxTicksLimit: 20 }} }},
+              y: {{ title: {{ display: true, text: 'g' }} }}
+            }}
+          }}
+        }});
+      }})
+      .catch(err => {{
+        document.getElementById('status').innerText = 'Fetch failed: ' + err;
+      }});
+  </script>
+</body>
+</html>
+"""
+
+
 @app.route("/devices/<device_id>/status")
 def get_status(device_id):
     """Latest reading - a quick 'is this machine OK right now' endpoint."""
