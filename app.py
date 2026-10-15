@@ -62,7 +62,27 @@ def run_startup_migrations():
                 connection.rollback()
 
 
+def reset_database_if_requested():
+    """
+    One-time, explicitly-opt-in wipe: only runs when the RESET_DB env var
+    is set to "true" on Render. Drops the readings/devices tables so the
+    next db.create_all() rebuilds them from scratch with every column the
+    current models.py defines (band_energies included) - a clean slate
+    instead of patching old rows forward. Leave RESET_DB unset (or set it
+    back to "false") after the one deploy that needs this, so a later
+    redeploy never wipes data again by accident.
+    """
+    if os.environ.get("RESET_DB") != "true":
+        return
+    with db.engine.connect() as connection:
+        connection.execute(text("DROP TABLE IF EXISTS readings CASCADE"))
+        connection.execute(text("DROP TABLE IF EXISTS devices CASCADE"))
+        connection.commit()
+    print("[reset] RESET_DB=true - dropped readings and devices tables, starting fresh.")
+
+
 with app.app_context():
+    reset_database_if_requested()
     db.create_all()
     run_startup_migrations()
 
