@@ -1,6 +1,7 @@
 import os
 import numpy as np
 from flask import Flask, jsonify, request
+from sqlalchemy import text
 
 from models import db, Device, Reading
 from mqtt_listener import start_mqtt_listener
@@ -16,8 +17,43 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db.init_app(app)
 
+
+def run_startup_migrations():
+    """
+    db.create_all() only creates tables that don't exist yet - it never
+    alters a table that's already there, even if a column was added to the
+    model afterwards (this is exactly how `band_energies` ended up missing
+    from the live `readings` table and causing 500s on every reading page).
+
+    Postgres' `ADD COLUMN IF NOT EXISTS` (9.6+) makes this safe to run on
+    every single startup: if the column is already there, it's a no-op.
+    So any column added to models.py in the future just needs a line here
+    and it will self-heal on the next deploy, with no manual SQL needed on
+    Render (whose Postgres query tool is read-only anyway).
+    """
+    statements = [
+        "ALTER TABLE readings ADD COLUMN IF NOT EXISTS band_energies JSON",
+        "ALTER TABLE readings ADD COLUMN IF NOT EXISTS raw_waveform BYTEA",
+        "ALTER TABLE readings ADD COLUMN IF NOT EXISTS absolute_peak_velocity_mms DOUBLE PRECISION",
+        "ALTER TABLE readings ADD COLUMN IF NOT EXISTS dominant_freq_mag DOUBLE PRECISION",
+        "ALTER TABLE readings ADD COLUMN IF NOT EXISTS is_anomaly BOOLEAN DEFAULT FALSE",
+    ]
+    with db.engine.connect() as connection:
+        for statement in statements:
+            try:
+                connection.execute(text(statement))
+                connection.commit()
+            except Exception as exc:
+                # Don't let one bad statement take the whole app down on
+                # boot - log it and keep going so the rest of the app
+                # (and the rest of the migrations) still comes up.
+                print(f"[migration] skipped '{statement}': {exc}")
+                connection.rollback()
+
+
 with app.app_context():
     db.create_all()
+    run_startup_migrations()
 
 start_mqtt_listener(app, db, Device, Reading)
 
