@@ -11,7 +11,18 @@ app = Flask(__name__)
 
 # Render's Postgres connection string starts with "postgres://", but
 # SQLAlchemy needs "postgresql://" - this handles that automatically.
-database_url = os.environ["DATABASE_URL"].replace("postgres://", "postgresql://", 1)
+# Pinned explicitly to "+psycopg2" (not just "postgresql://") because
+# requirements.txt only installs psycopg2-binary, but newer SQLAlchemy
+# versions default a driverless "postgresql://" URL to the psycopg
+# (v3) dialect, which isn't installed - that mismatch is what crashed
+# the app on this deploy's fresh pip install with ModuleNotFoundError:
+# No module named 'psycopg'. Pinning the driver removes the ambiguity
+# regardless of which SQLAlchemy version ends up installed later.
+database_url = os.environ["DATABASE_URL"]
+if database_url.startswith("postgres://"):
+    database_url = "postgresql+psycopg2://" + database_url[len("postgres://"):]
+elif database_url.startswith("postgresql://"):
+    database_url = "postgresql+psycopg2://" + database_url[len("postgresql://"):]
 app.config["SQLALCHEMY_DATABASE_URI"] = database_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
